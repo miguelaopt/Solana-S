@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Wallet Scraper Every 6 Hours
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*-*-* 00,06,12,18:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

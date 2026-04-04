@@ -1,0 +1,19 @@
+[Unit]
+Description=Solana Memecoin Sniper Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=syndicate
+WorkingDirectory=/home/syndicate/solana-syndicate
+EnvironmentFile=/home/syndicate/solana-syndicate/.env
+ExecStart=/home/syndicate/solana-syndicate/venv/bin/python sniper_bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sniper
+
+[Install]
+WantedBy=multi-user.target

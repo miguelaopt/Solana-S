@@ -1,0 +1,13 @@
+[Unit]
+Description=Wallet Auto-Discovery Scraper
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=syndicate
+WorkingDirectory=/home/syndicate/solana-syndicate
+EnvironmentFile=/home/syndicate/solana-syndicate/.env
+ExecStart=/home/syndicate/solana-syndicate/venv/bin/python wallet_scraper.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=scraper
