@@ -1,0 +1,41 @@
+{
+  "TARGET_WALLETS": [],
+  "PRUNED_WALLETS": [],
+  "risk": {
+    "buy_amount_sol": 0.1,
+    "slippage_bps_entry": 1000,
+    "slippage_bps_exit": 2000,
+    "max_positions": 5,
+    "max_price_impact_pct": 25.0,
+    "take_profit_multiplier": 2.0,
+    "trailing_stop_pct": 0.25
+  },
+  "filters": {
+    "min_win_rate": 0.60,
+    "prune_win_rate": 0.40,
+    "min_trades_for_qualification": 5,
+    "max_tx_per_day": 500,
+    "min_unique_tokens_traded": 3,
+    "prune_lookback_days": 7,
+    "discovery_pool_min_volume_usd": 500000,
+    "discovery_pool_max_age_hours": 24
+  },
+  "free_tier": {
+    "enabled": true,
+    "max_tracked_wallets": 10,
+    "scraper_delay_between_wallets_sec": 4.0,
+    "scraper_delay_between_pools_sec": 8.0,
+    "scraper_delay_between_tx_fetches_sec": 2.0,
+    "dexscreener_max_pools_per_run": 10,
+    "dexscreener_traders_per_pool": 8,
+    "observation_phase_min_hours": 12,
+    "use_birdeye": false,
+    "note": "Free-tier mode: DexScreener only, max 10 WS subscriptions, aggressive rate limiting"
+  },
+  "meta": {
+    "last_scraper_run": null,
+    "last_prune_run": null,
+    "bootstrap_started_ts": null,
+    "version": "1.1.0-freetier"
+  }
+}
