@@ -561,16 +561,48 @@ async def analyze_transaction(
         meta.postTokenBalances[]  — {accountIndex, mint, owner, uiTokenAmount}
         transaction.message.accountKeys[i].pubkey
     """
-    try:
-        tx = await http_rpc(http, "getTransaction", [
-            signature,
-            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-        ])
-    except Exception as e:
-        log.debug(f"getTransaction failed for {signature[:12]}: {e}")
-        return
+    # ── Initial delay: give Helius time to index the transaction ─────────────
+    # logsSubscribe fires at "processed" commitment — the tx exists on-chain
+    # but Helius's getTransaction index lags by ~1-3s. Without this delay,
+    # getTransaction returns null and we lose the signal silently.
+    await asyncio.sleep(2)
+
+    # ── Retry loop: up to 3 attempts, 2s apart ────────────────────────────────
+    tx   = None
+    RETRIES      = 3
+    RETRY_DELAY  = 2  # seconds between attempts
+
+    for attempt in range(1, RETRIES + 1):
+        try:
+            tx = await http_rpc(http, "getTransaction", [
+                signature,
+                {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+            ])
+        except Exception as e:
+            log.info(
+                f"getTransaction error (attempt {attempt}/{RETRIES}) "
+                f"for {signature[:12]}: {e}"
+            )
+            tx = None
+
+        if tx:
+            log.info(
+                f"📥 TX fetched (attempt {attempt}/{RETRIES}): {signature[:12]}..."
+            )
+            break
+
+        if attempt < RETRIES:
+            log.info(
+                f"⏳ TX not indexed yet (attempt {attempt}/{RETRIES}) — "
+                f"retrying in {RETRY_DELAY}s... [{signature[:12]}]"
+            )
+            await asyncio.sleep(RETRY_DELAY)
 
     if not tx:
+        log.info(
+            f"❌ TX still null after {RETRIES} attempts — "
+            f"Helius indexing too slow. Sig: {signature[:12]}..."
+        )
         return
 
     meta = tx.get("meta") or {}
@@ -605,9 +637,9 @@ async def analyze_transaction(
 
     if sol_spent < MIN_SOL_SPENT:
         # Wallet gained SOL (a sell), or only paid dust fees — not a buy
-        log.debug(
+        log.info(
             f"Skipping {signature[:12]}: SOL delta = {sol_spent:+.6f} SOL "
-            f"(min buy = {MIN_SOL_SPENT} SOL)"
+            f"(threshold = {MIN_SOL_SPENT} SOL — likely a sell or fee-only tx)"
         )
         return
 
