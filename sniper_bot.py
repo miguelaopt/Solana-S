@@ -507,6 +507,7 @@ async def on_signal(wallet: str, mint: str, http: httpx.AsyncClient, cfg_data: d
 
 
 # ─── Transaction Analyzer ─────────────────────────────────────────────────────
+# ─── Transaction Analyzer ─────────────────────────────────────────────────────
 async def init_wallet_token_cache(wallet: str, http: httpx.AsyncClient) -> None:
     try:
         result = await http_rpc(http, "getTokenAccountsByOwner", [
@@ -609,13 +610,10 @@ async def analyze_transaction(
     post_bal = meta.get("postBalances", [])
     if wallet_idx >= len(pre_bal) or wallet_idx >= len(post_bal): return
 
+    # 1. Calcular SOL nativo gasto
     sol_spent = -(post_bal[wallet_idx] - pre_bal[wallet_idx]) / 1e9
 
-    if sol_spent < MIN_SOL_SPENT:
-        log.info(f"🗑️ Skipping {signature[:8]}: Dust/Fee ({sol_spent:+.6f} SOL). Cooldown wallet {wallet[:8]} for 3s.")
-        state.ignore_wallet(wallet, 3.0)
-        return
-
+    # 2. Construir mapas de tokens ANTES da verificação de threshold
     def token_map(balances: list) -> dict:
         out = {}
         for e in balances:
@@ -628,6 +626,21 @@ async def analyze_transaction(
     pre_map  = token_map(meta.get("preTokenBalances",  []))
     post_map = token_map(meta.get("postTokenBalances", []))
 
+    # 3. Calcular WSOL gasto
+    wsol_pre = pre_map.get((WSOL_MINT, wallet), 0.0)
+    wsol_post = post_map.get((WSOL_MINT, wallet), 0.0)
+    wsol_spent = wsol_pre - wsol_post
+
+    # 4. Calcular o Gasto Total (Nativo + Wrapped)
+    total_sol_spent = sol_spent + wsol_spent
+
+    # 5. Verificação do Threshold usando o valor total
+    if total_sol_spent < MIN_SOL_SPENT:
+        log.info(f"🗑️ Skipping {signature[:8]}: Dust/Fee/WSOL ({total_sol_spent:+.6f} SOL total). Cooldown wallet {wallet[:8]} for 3s.")
+        state.ignore_wallet(wallet, 3.0)
+        return
+
+    # 6. Procurar a moeda comprada
     for (mint, owner), post_amt in post_map.items():
         if owner != wallet: continue
         if mint in IGNORED_MINTS or mint in known_mints: continue
