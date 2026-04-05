@@ -52,9 +52,20 @@ HELIUS_WS     = os.getenv("HELIUS_RPC_WS", "")
 JITO_URL      = os.getenv("JITO_BLOCK_ENGINE_URL", "")
 
 SOL_MINT  = "So11111111111111111111111111111111111111112"
-RAYDIUM   = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
-PUMPFUN   = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-MINT_RE   = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+# Mints that are never buy signals (stablecoins, wSOL, known base tokens)
+IGNORED_MINTS: set[str] = {
+    SOL_MINT,
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  # ETH (Wormhole)
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  # mSOL
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+}
+
+# Minimum SOL spent to count as a real buy (filters dust / fee-only txs)
+MIN_SOL_SPENT = 0.001  # 0.001 SOL ≈ $0.15
 
 JITO_TIP_ACCOUNTS = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
@@ -520,35 +531,134 @@ async def on_signal(wallet: str, mint: str, http: httpx.AsyncClient, cfg_data: d
         state.processing.discard(mint)
 
 
-# ─── Log / Transaction Parser ─────────────────────────────────────────────────
-async def process_log(
-    wallet: str,
-    log_data: dict,
+# ─── Transaction Analyzer — Balance-Diff Signal Detection ────────────────────
+async def analyze_transaction(
+    wallet:      str,
+    signature:   str,
+    http:        httpx.AsyncClient,
+    cfg_data:    dict,
     known_mints: set[str],
-    http: httpx.AsyncClient,
-    cfg_data: dict
-):
-    logs = log_data.get("logs", [])
-    if log_data.get("err"):
-        return
-    if not any(RAYDIUM in l or PUMPFUN in l for l in logs):
+) -> None:
+    """
+    THE CORE FIX — router-agnostic buy detection.
+
+    Old approach (BROKEN):
+        Read log strings, grep for "Raydium" / "Pump.fun".
+        Fails on Jupiter, Orca, Meteora, Moonshot, and any multi-hop route.
+
+    New approach (CORRECT):
+        Fetch the full transaction and compare token balances before and after.
+        A "buy" is defined purely in economic terms:
+          • The tracked wallet's SOL balance decreased (they spent SOL)
+          • The tracked wallet received ≥ 1 SPL token they didn't hold before
+          • The received token is not a stablecoin / WSOL / ignored mint
+        This works for ANY DEX, ANY router, ANY number of hops.
+
+    Data sources used:
+        meta.preBalances[i]       — lamports before tx, indexed by account
+        meta.postBalances[i]      — lamports after tx, indexed by account
+        meta.preTokenBalances[]   — {accountIndex, mint, owner, uiTokenAmount}
+        meta.postTokenBalances[]  — {accountIndex, mint, owner, uiTokenAmount}
+        transaction.message.accountKeys[i].pubkey
+    """
+    try:
+        tx = await http_rpc(http, "getTransaction", [
+            signature,
+            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+        ])
+    except Exception as e:
+        log.debug(f"getTransaction failed for {signature[:12]}: {e}")
         return
 
-    for line in logs:
-        for addr in MINT_RE.findall(line):
-            if addr not in known_mints and addr != wallet:
-                try:
-                    if state.ws_connected and _ws_conn:
-                        info = await get_account_info_ws(addr)
-                    else:
-                        info = await get_account_info_http(http, addr)
+    if not tx:
+        return
 
-                    if info and info.get("data", {}).get("parsed", {}).get("type") == "mint":
-                        known_mints.add(addr)
-                        asyncio.create_task(on_signal(wallet, addr, http, cfg_data))
-                        return
-                except Exception:
-                    pass
+    meta = tx.get("meta") or {}
+    if meta.get("err"):
+        return  # Failed transaction — skip
+
+    # ── 1. Find wallet's account index ───────────────────────────────────────
+    account_keys: list[dict] = (
+        tx.get("transaction", {})
+          .get("message", {})
+          .get("accountKeys", [])
+    )
+    wallet_idx: int | None = None
+    for i, ak in enumerate(account_keys):
+        pubkey = ak.get("pubkey") if isinstance(ak, dict) else str(ak)
+        if pubkey == wallet:
+            wallet_idx = i
+            break
+
+    if wallet_idx is None:
+        return  # Wallet not a direct participant (shouldn't happen with logsSubscribe)
+
+    # ── 2. SOL balance delta ─────────────────────────────────────────────────
+    pre_balances:  list[int] = meta.get("preBalances",  [])
+    post_balances: list[int] = meta.get("postBalances", [])
+
+    if wallet_idx >= len(pre_balances) or wallet_idx >= len(post_balances):
+        return
+
+    sol_delta_lamports = post_balances[wallet_idx] - pre_balances[wallet_idx]
+    sol_spent          = -sol_delta_lamports / 1e9   # positive = SOL was spent
+
+    if sol_spent < MIN_SOL_SPENT:
+        # Wallet gained SOL (a sell), or only paid dust fees — not a buy
+        log.debug(
+            f"Skipping {signature[:12]}: SOL delta = {sol_spent:+.6f} SOL "
+            f"(min buy = {MIN_SOL_SPENT} SOL)"
+        )
+        return
+
+    # ── 3. Token balance delta — find newly received mints ───────────────────
+    pre_token:  list[dict] = meta.get("preTokenBalances",  [])
+    post_token: list[dict] = meta.get("postTokenBalances", [])
+
+    # Build lookup: (mint, owner) → uiAmount
+    def token_map(balances: list[dict]) -> dict[tuple[str, str], float]:
+        result = {}
+        for entry in balances:
+            mint  = entry.get("mint", "")
+            owner = entry.get("owner", "")
+            amt   = float(
+                (entry.get("uiTokenAmount") or {}).get("uiAmount") or 0
+            )
+            result[(mint, owner)] = amt
+        return result
+
+    pre_map  = token_map(pre_token)
+    post_map = token_map(post_token)
+
+    # Find mints where the wallet received tokens
+    bought_mints: list[tuple[str, float]] = []  # [(mint, amount_received)]
+
+    for (mint, owner), post_amt in post_map.items():
+        if owner != wallet:
+            continue
+        if mint in IGNORED_MINTS or mint in known_mints:
+            continue
+
+        pre_amt   = pre_map.get((mint, owner), 0.0)
+        delta     = post_amt - pre_amt
+
+        if delta > 0:
+            bought_mints.append((mint, delta))
+
+    if not bought_mints:
+        return
+
+    # ── 4. Fire signal for each new mint (usually just one) ──────────────────
+    for mint, token_delta in bought_mints:
+        log.info(
+            f"💡 BUY DETECTED | Wallet: {wallet[:10]}... | "
+            f"Mint: {mint[:10]}... | "
+            f"SOL spent: {sol_spent:.4f} | "
+            f"Tokens received: {token_delta:,.2f} | "
+            f"Tx: {signature[:12]}..."
+        )
+        known_mints.add(mint)
+        asyncio.create_task(on_signal(wallet, mint, http, cfg_data))
 
 
 # ─── [FIX 1] WebSocket Heartbeat ─────────────────────────────────────────────
@@ -570,15 +680,14 @@ async def heartbeat_task(ws):
 # ─── [FIX 2] HTTP Polling Fallback ───────────────────────────────────────────
 async def polling_fallback_loop(http: httpx.AsyncClient, cfg_data: dict):
     """
-    Polling mode — activated when WS fails 3× in a row.
-    Polls getSignaturesForAddress for each tracked wallet every 2.5s.
-    Detects new signatures and fetches full transaction data to find swaps.
-    Slower than WS (~2.5s latency vs ~400ms) but never disconnects.
+    HTTP polling fallback — activated when WS fails 3× in a row.
+    Every 2.5s, checks each tracked wallet for new transactions.
+    Uses analyze_transaction (balance-diff) — same logic as WS path.
     """
     log.info("🔄 POLLING MODE ACTIVE — WS unavailable, using HTTP polling")
     state.polling_mode = True
-    known_mints: set[str] = {SOL_MINT}
-    poll_interval = 2.5  # seconds between full wallet sweeps
+    known_mints: set[str] = set(IGNORED_MINTS)
+    poll_interval = 2.5
 
     while state.polling_mode:
         cfg_data = await read_config()
@@ -586,55 +695,29 @@ async def polling_fallback_loop(http: httpx.AsyncClient, cfg_data: dict):
 
         for wallet in wallets:
             try:
-                result = await http_rpc(
+                sigs = await http_rpc(
                     http,
                     "getSignaturesForAddress",
-                    [wallet, {"limit": 5, "commitment": "confirmed"}]
+                    [wallet, {"limit": 3, "commitment": "confirmed"}]
                 )
-
-                if not isinstance(result, list) or not result:
+                if not isinstance(sigs, list) or not sigs:
                     continue
 
-                newest_sig = result[0].get("signature", "")
-                last_sig   = state.last_sigs.get(wallet, "")
-
-                if newest_sig == last_sig:
-                    continue  # No new transactions
+                newest_sig = sigs[0].get("signature", "")
+                if not newest_sig or sigs[0].get("err"):
+                    continue
+                if newest_sig == state.last_sigs.get(wallet):
+                    continue   # Already processed
 
                 state.last_sigs[wallet] = newest_sig
-
-                # Only fetch tx if there's no error on the signature
-                if result[0].get("err"):
-                    continue
-
-                tx_result = await http_rpc(
-                    http,
-                    "getTransaction",
-                    [newest_sig, {
-                        "encoding": "jsonParsed",
-                        "maxSupportedTransactionVersion": 0
-                    }]
+                await analyze_transaction(
+                    wallet, newest_sig, http, cfg_data, known_mints
                 )
-
-                if not tx_result:
-                    continue
-
-                # Convert to log-like format for reuse of process_log logic
-                meta = tx_result.get("meta", {}) or {}
-                log_messages = meta.get("logMessages", [])
-
-                if any(RAYDIUM in l or PUMPFUN in l for l in log_messages):
-                    fake_log_data = {
-                        "logs": log_messages,
-                        "err":  meta.get("err"),
-                        "signature": newest_sig
-                    }
-                    await process_log(wallet, fake_log_data, known_mints, http, cfg_data)
 
             except Exception as e:
                 log.error(f"Polling error for {wallet[:10]}: {e}")
 
-            await asyncio.sleep(0.3)  # Small delay between wallet checks
+            await asyncio.sleep(0.5)
 
         await asyncio.sleep(poll_interval)
 
@@ -684,15 +767,21 @@ async def message_pump(
 
                 # ── Dispatch log notifications ────────────────────────────
                 if method == "logsNotification":
-                    params   = msg.get("params", {})
-                    sub_id   = params.get("subscription")
-                    log_data = params.get("result", {})
-                    wallet   = sub_map.get(sub_id)
-                    if wallet:
+                    params    = msg.get("params", {})
+                    sub_id    = params.get("subscription")
+                    result    = params.get("result", {})
+                    wallet    = sub_map.get(sub_id)
+                    value     = result.get("value", {})
+                    signature = value.get("signature", "")
+                    err       = value.get("err")
+
+                    if wallet and signature and not err:
+                        # Router-agnostic: fetch full tx, diff token balances.
+                        # Works for Jupiter, Orca, Raydium, Pump.fun, Meteora,
+                        # Moonshot — any DEX, any number of hops.
                         asyncio.create_task(
-                            process_log(
-                                wallet, log_data, known_mints,
-                                http, cfg_ref[0]
+                            analyze_transaction(
+                                wallet, signature, http, cfg_ref[0], known_mints
                             )
                         )
 
