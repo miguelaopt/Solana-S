@@ -215,6 +215,7 @@ def get_buy_amount(cfg_data: dict) -> tuple[float, int]:
     return sol, lamports
 
 
+
 # ─── Rug-Pull Check ───────────────────────────────────────────────────────────
 async def is_token_safe(
     mint: str,
@@ -222,7 +223,8 @@ async def is_token_safe(
 ) -> tuple[bool, str]:
     """
     Check mint authority and freeze authority on-chain.
-    Uses WS if available, falls back to HTTP.
+    MODIFICADO: Ignora erros de "not found" ou timeout para priorizar velocidade.
+    Apenas bloqueia a compra se for confirmado afirmativamente que é rug.
     """
     try:
         if state.ws_connected and _ws_conn:
@@ -230,17 +232,21 @@ async def is_token_safe(
         elif client:
             info = await get_account_info_http(client, mint)
         else:
-            return False, "No RPC connection available"
+            # ASSUME SEGURO se não houver cliente
+            return True, "No RPC connection (Assumed safe for speed)"
 
         if not info:
-            return False, "Mint account not found"
+            # ALTERAÇÃO PRINCIPAL: RPC lento não encontrou a moeda? Avança na mesma!
+            return True, "Mint account not found (Ignored for speed)"
 
         parsed   = info.get("data", {}).get("parsed", {})
         mint_inf = parsed.get("info", {})
 
-        if parsed.get("type") != "mint":
+        # Se conseguiu ler os dados e o tipo não for mint, bloqueia
+        if parsed and parsed.get("type") != "mint":
             return False, "Not an SPL mint"
 
+        # BLOQUEIA APENAS SE CONFIRMAR O RUG
         if mint_inf.get("mintAuthority") is not None:
             return False, f"Mint authority live: {str(mint_inf['mintAuthority'])[:10]}..."
         if mint_inf.get("freezeAuthority") is not None:
@@ -249,9 +255,11 @@ async def is_token_safe(
         return True, "OK"
 
     except asyncio.TimeoutError:
-        return False, "RPC timeout during rug check"
+        # Se o RPC demorar demasiado a responder à verificação, avança!
+        return True, "RPC timeout during rug check (Ignored for speed)"
     except Exception as e:
-        return False, f"Rug check error: {e}"
+        # Qualquer outro erro de leitura é ignorado
+        return True, f"Rug check error ignored: {e}"
 
 
 # ─── Jupiter Client ───────────────────────────────────────────────────────────
