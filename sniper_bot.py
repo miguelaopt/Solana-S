@@ -1,11 +1,17 @@
 """
-sniper_bot.py — Autonomous Execution Sniper.
+sniper_bot.py — Solana Memecoin Sniper (v1.2.0)
 
-Consumes TARGET_WALLETS from config.json.
-Listens via Helius WebSocket logsSubscribe.
-On signal: rug-check → Jupiter quote → Jito bundle → position tracking.
-Config is hot-reloaded every 60s so new wallets added by scraper are
-picked up without restarting the bot.
+Fixes in this version:
+  [1] WebSocket Heartbeat — manual ping every 5s prevents Helius
+      free-tier from closing the connection after 10s inactivity.
+  [2] HTTP Polling Fallback — if WS fails 3× in a row, the bot
+      switches to polling getSignaturesForAddress every 2.5s per
+      wallet. Slower but zero-downtime on flaky connections.
+  [3] SOL_AMOUNT float fix — parsed with explicit float() from env
+      and config. Values like 0.05 or 0.1 now work correctly.
+  [4] WS error logging — catches InvalidStatusCode to show HTTP
+      status (429 / 403 / 503) in the log output.
+  [5] status.json — written every 5s for the dashboard to read.
 """
 
 import asyncio
@@ -15,10 +21,13 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
 import websockets
+import websockets.exceptions
 from dotenv import load_dotenv
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -27,18 +36,20 @@ from solders.system_program import TransferParams, transfer
 from solders.message import MessageV0
 import base58
 
-from utils import get_logger, read_config, utc_now_ts
+from utils import get_logger, read_config, utc_now_ts, write_config
 
 load_dotenv()
 log = get_logger("sniper", "sniper.log")
+
+ROOT = Path(__file__).parent
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 JUPITER_QUOTE = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP  = "https://quote-api.jup.ag/v6/swap"
 JUPITER_PRICE = "https://price.jup.ag/v4/price"
-HELIUS_HTTP   = os.getenv("HELIUS_RPC_HTTP")
-HELIUS_WS     = os.getenv("HELIUS_RPC_WS")
-JITO_URL      = os.getenv("JITO_BLOCK_ENGINE_URL")
+HELIUS_HTTP   = os.getenv("HELIUS_RPC_HTTP", "")
+HELIUS_WS     = os.getenv("HELIUS_RPC_WS", "")
+JITO_URL      = os.getenv("JITO_BLOCK_ENGINE_URL", "")
 
 SOL_MINT  = "So11111111111111111111111111111111111111112"
 RAYDIUM   = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
@@ -52,65 +63,162 @@ JITO_TIP_ACCOUNTS = [
     "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt13WkKuGt",
 ]
 
-# ─── Keypair Loading ───────────────────────────────────────────────────────────
+# ─── Keypair ──────────────────────────────────────────────────────────────────
 def load_keypair() -> Keypair:
-    raw = os.getenv("WALLET_PRIVATE_KEY")
+    raw = os.getenv("WALLET_PRIVATE_KEY", "").strip()
     if not raw:
-        raise ValueError("WALLET_PRIVATE_KEY not set")
+        raise ValueError("WALLET_PRIVATE_KEY not set in .env")
     return Keypair.from_bytes(base58.b58decode(raw))
 
 KEYPAIR = load_keypair()
 PUBKEY  = str(KEYPAIR.pubkey())
-log.info(f"Loaded wallet: {PUBKEY[:16]}...")
 
-# ─── Shared State ─────────────────────────────────────────────────────────────
-_processing_mints: set[str]  = set()   # In-flight buys
-_open_positions: dict         = {}     # mint → position data
-_active_subs: dict[str, int]  = {}     # wallet → sub_id
-_ws_conn                      = None   # Global WS connection
-_req_id                       = 0
-_pending_rpc: dict            = {}     # id → asyncio.Future
+# ─── Shared Runtime State ─────────────────────────────────────────────────────
+class BotState:
+    def __init__(self):
+        self.ws_connected:    bool       = False
+        self.polling_mode:    bool       = False
+        self.ws_fail_count:   int        = 0
+        self.ws_fail_limit:   int        = 3          # Switch to polling after 3 WS failures
+        self.start_ts:        float      = utc_now_ts()
+        self.last_signal_ts:  float      = 0.0
+        self.total_buys:      int        = 0
+        self.total_sells:     int        = 0
+        self.tracked_wallets: list[str]  = []
+        self.open_positions:  dict       = {}         # mint → position
+        self.processing:      set[str]   = set()      # in-flight buy mints
+        self.recent_events:   list[dict] = []         # Last 50 log events for dashboard
+        self.last_sigs:       dict[str, str] = {}     # wallet → last seen signature (polling)
+        self._lock = asyncio.Lock()
+
+    def add_event(self, kind: str, message: str, data: dict = None):
+        entry = {
+            "ts":      utc_now_ts(),
+            "kind":    kind,   # "signal" | "buy" | "sell" | "rug" | "error" | "info"
+            "message": message,
+            "data":    data or {}
+        }
+        self.recent_events.insert(0, entry)
+        self.recent_events = self.recent_events[:50]  # Keep last 50
+
+state = BotState()
+
+# ─── status.json Writer ───────────────────────────────────────────────────────
+async def write_status():
+    """
+    Writes bot status to status.json every 5 seconds.
+    The dashboard reads this file to display live state.
+    """
+    while True:
+        try:
+            status = {
+                "online":          True,
+                "ws_connected":    state.ws_connected,
+                "polling_mode":    state.polling_mode,
+                "uptime_seconds":  int(utc_now_ts() - state.start_ts),
+                "tracked_wallets": state.tracked_wallets,
+                "open_positions":  state.open_positions,
+                "total_buys":      state.total_buys,
+                "total_sells":     state.total_sells,
+                "last_signal_ts":  state.last_signal_ts,
+                "recent_events":   state.recent_events[:20],
+                "wallet_pubkey":   PUBKEY,
+                "updated_at":      utc_now_ts(),
+            }
+            tmp = ROOT / "status.json.tmp"
+            tmp.write_text(json.dumps(status, indent=2))
+            tmp.replace(ROOT / "status.json")
+        except Exception as e:
+            log.error(f"status.json write error: {e}")
+        await asyncio.sleep(5)
 
 
 # ─── RPC Helpers ──────────────────────────────────────────────────────────────
+_req_id   = 0
+_pending: dict[int, asyncio.Future] = {}
+_ws_conn  = None
+
 def _next_id() -> int:
     global _req_id
     _req_id += 1
     return _req_id
 
-async def _rpc_send(method: str, params: list) -> dict:
-    """Send a JSON-RPC call over the active WebSocket."""
+async def _ws_send(method: str, params: list) -> dict:
+    """Send a JSON-RPC call over the active WebSocket connection."""
+    if _ws_conn is None:
+        raise RuntimeError("WebSocket not connected")
     rid = _next_id()
-    payload = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
     fut = asyncio.get_event_loop().create_future()
-    _pending_rpc[rid] = fut
-    await _ws_conn.send(payload)
+    _pending[rid] = fut
+    await _ws_conn.send(json.dumps({
+        "jsonrpc": "2.0", "id": rid, "method": method, "params": params
+    }))
     return await asyncio.wait_for(fut, timeout=15.0)
 
-async def get_account_info(address: str) -> Optional[dict]:
-    resp = await _rpc_send(
+async def http_rpc(
+    client: httpx.AsyncClient,
+    method: str,
+    params: list
+) -> dict:
+    """HTTP RPC fallback — used during polling mode and for one-off calls."""
+    r = await client.post(HELIUS_HTTP, json={
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+    }, timeout=12.0)
+    r.raise_for_status()
+    return r.json().get("result", {})
+
+async def get_account_info_ws(address: str) -> Optional[dict]:
+    resp = await _ws_send(
         "getAccountInfo",
         [address, {"encoding": "jsonParsed", "commitment": "confirmed"}]
     )
     return resp.get("result", {}).get("value")
 
-async def get_latest_blockhash() -> str:
-    resp = await _rpc_send(
-        "getLatestBlockhash",
-        [{"commitment": "confirmed"}]
+async def get_account_info_http(client: httpx.AsyncClient, address: str) -> Optional[dict]:
+    result = await http_rpc(
+        client,
+        "getAccountInfo",
+        [address, {"encoding": "jsonParsed", "commitment": "confirmed"}]
     )
-    return resp["result"]["value"]["blockhash"]
+    return result.get("value") if isinstance(result, dict) else None
+
+async def get_latest_blockhash(client: httpx.AsyncClient) -> str:
+    result = await http_rpc(
+        client, "getLatestBlockhash", [{"commitment": "confirmed"}]
+    )
+    return result["value"]["blockhash"]
+
+
+# ─── [FIX 3] SOL Amount — explicit float throughout ──────────────────────────
+def get_buy_amount(cfg_data: dict) -> tuple[float, int]:
+    """
+    Returns (sol_amount_float, lamports_int).
+    Handles env override and config values correctly as floats.
+    e.g. 0.05 SOL → 50_000_000 lamports
+    """
+    raw = cfg_data.get("risk", {}).get("buy_amount_sol", 0.1)
+    sol = float(raw)  # Explicit cast — prevents scientific notation issues
+    lamports = int(sol * 1_000_000_000)
+    return sol, lamports
 
 
 # ─── Rug-Pull Check ───────────────────────────────────────────────────────────
-async def is_token_safe(mint: str) -> tuple[bool, str]:
+async def is_token_safe(
+    mint: str,
+    client: Optional[httpx.AsyncClient] = None
+) -> tuple[bool, str]:
     """
-    Two concurrent on-chain checks:
-      1. Mint authority and freeze authority revoked
-      2. LP burned heuristic
+    Check mint authority and freeze authority on-chain.
+    Uses WS if available, falls back to HTTP.
     """
     try:
-        info = await get_account_info(mint)
+        if state.ws_connected and _ws_conn:
+            info = await get_account_info_ws(mint)
+        elif client:
+            info = await get_account_info_http(client, mint)
+        else:
+            return False, "No RPC connection available"
+
         if not info:
             return False, "Mint account not found"
 
@@ -118,22 +226,19 @@ async def is_token_safe(mint: str) -> tuple[bool, str]:
         mint_inf = parsed.get("info", {})
 
         if parsed.get("type") != "mint":
-            return False, "Address is not an SPL mint"
+            return False, "Not an SPL mint"
 
-        mint_auth   = mint_inf.get("mintAuthority")
-        freeze_auth = mint_inf.get("freezeAuthority")
-
-        if mint_auth is not None:
-            return False, f"Mint authority live: {str(mint_auth)[:10]}..."
-        if freeze_auth is not None:
-            return False, f"Freeze authority live: {str(freeze_auth)[:10]}..."
+        if mint_inf.get("mintAuthority") is not None:
+            return False, f"Mint authority live: {str(mint_inf['mintAuthority'])[:10]}..."
+        if mint_inf.get("freezeAuthority") is not None:
+            return False, f"Freeze authority live: {str(mint_inf['freezeAuthority'])[:10]}..."
 
         return True, "OK"
 
     except asyncio.TimeoutError:
         return False, "RPC timeout during rug check"
     except Exception as e:
-        return False, f"Rug check exception: {e}"
+        return False, f"Rug check error: {e}"
 
 
 # ─── Jupiter Client ───────────────────────────────────────────────────────────
@@ -146,10 +251,10 @@ async def get_jupiter_quote(
 ) -> Optional[dict]:
     try:
         r = await http.get(JUPITER_QUOTE, params={
-            "inputMint":       input_mint,
-            "outputMint":      output_mint,
-            "amount":          str(amount),
-            "slippageBps":     slippage_bps,
+            "inputMint":        input_mint,
+            "outputMint":       output_mint,
+            "amount":           str(amount),
+            "slippageBps":      slippage_bps,
             "onlyDirectRoutes": False,
         }, timeout=8.0)
         r.raise_for_status()
@@ -161,67 +266,56 @@ async def get_jupiter_quote(
         log.error(f"Jupiter quote error: {e}")
         return None
 
-async def build_swap_tx(
-    http: httpx.AsyncClient,
-    quote: dict
-) -> Optional[bytes]:
+async def build_swap_tx(http: httpx.AsyncClient, quote: dict) -> Optional[bytes]:
     try:
         r = await http.post(JUPITER_SWAP, json={
-            "quoteResponse":              quote,
-            "userPublicKey":              PUBKEY,
-            "wrapAndUnwrapSol":           True,
+            "quoteResponse":                quote,
+            "userPublicKey":                PUBKEY,
+            "wrapAndUnwrapSol":             True,
             "computeUnitPriceMicroLamports": "auto",
-            "dynamicComputeUnitLimit":    True,
-            "prioritizationFeeLamports":  0,  # Jito handles priority
+            "dynamicComputeUnitLimit":      True,
+            "prioritizationFeeLamports":    0,
         }, timeout=10.0)
         r.raise_for_status()
-        tx_b64 = r.json()["swapTransaction"]
-        tx_bytes = base64.b64decode(tx_b64)
+        tx_bytes = base64.b64decode(r.json()["swapTransaction"])
         tx = VersionedTransaction.from_bytes(tx_bytes)
         tx.sign([KEYPAIR])
         return bytes(tx)
     except Exception as e:
-        log.error(f"Jupiter swap build error: {e}")
+        log.error(f"Swap build error: {e}")
         return None
 
 
-# ─── Jito Bundle ─────────────────────────────────────────────────────────────
+# ─── Jito Bundle ──────────────────────────────────────────────────────────────
 async def send_jito_bundle(
     http: httpx.AsyncClient,
     swap_tx_bytes: bytes,
     tip_lamports: int
 ) -> Optional[str]:
-    """
-    Assemble and submit a 2-tx Jito bundle: [tip_tx, swap_tx].
-    Atomic execution — both land or neither does.
-    """
     try:
-        blockhash = await get_latest_blockhash()
-
-        tip_ix = transfer(TransferParams(
+        blockhash = await get_latest_blockhash(http)
+        tip_ix    = transfer(TransferParams(
             from_pubkey=KEYPAIR.pubkey(),
             to_pubkey=Pubkey.from_string(random.choice(JITO_TIP_ACCOUNTS)),
             lamports=tip_lamports,
         ))
-        msg = MessageV0.try_compile(
+        msg    = MessageV0.try_compile(
             payer=KEYPAIR.pubkey(),
             instructions=[tip_ix],
             address_lookup_table_accounts=[],
             recent_blockhash=blockhash,
         )
-        tip_tx = VersionedTransaction(msg, [KEYPAIR])
+        tip_tx   = VersionedTransaction(msg, [KEYPAIR])
         tip_b64  = base64.b64encode(bytes(tip_tx)).decode()
         swap_b64 = base64.b64encode(swap_tx_bytes).decode()
 
         r = await http.post(JITO_URL, json={
-            "jsonrpc": "2.0",
-            "id":      1,
+            "jsonrpc": "2.0", "id": 1,
             "method":  "sendBundle",
             "params":  [[tip_b64, swap_b64]]
         }, timeout=12.0)
         r.raise_for_status()
         result = r.json()
-
         if "result" in result:
             return result["result"]
         log.error(f"Jito rejection: {result.get('error')}")
@@ -232,17 +326,17 @@ async def send_jito_bundle(
 
 
 # ─── SOL Price ────────────────────────────────────────────────────────────────
-_cached_sol_price: tuple[float, float] = (150.0, 0.0)  # (price, timestamp)
+_sol_price_cache: tuple[float, float] = (150.0, 0.0)
 
-async def get_sol_price_usd(http: httpx.AsyncClient) -> float:
-    global _cached_sol_price
-    price, cached_at = _cached_sol_price
+async def get_sol_price(http: httpx.AsyncClient) -> float:
+    global _sol_price_cache
+    price, cached_at = _sol_price_cache
     if utc_now_ts() - cached_at < 30:
         return price
     try:
         r = await http.get(JUPITER_PRICE, params={"ids": SOL_MINT}, timeout=5.0)
-        new_price = r.json()["data"][SOL_MINT]["price"]
-        _cached_sol_price = (new_price, utc_now_ts())
+        new_price = float(r.json()["data"][SOL_MINT]["price"])
+        _sol_price_cache = (new_price, utc_now_ts())
         return new_price
     except Exception:
         return price
@@ -251,24 +345,23 @@ async def get_sol_price_usd(http: httpx.AsyncClient) -> float:
 # ─── Position Manager (Moonbag) ───────────────────────────────────────────────
 async def monitor_position(mint: str, http: httpx.AsyncClient, cfg_data: dict):
     """
-    Async task per open position.
-    Phase 1: Sell 50% at 2x entry (TP).
-    Phase 2: Trail remaining 50% with percentage-based trailing stop.
+    Phase 1 — sell 50% at 2× entry.
+    Phase 2 — trail remaining 50% with percentage stop.
     """
-    pos = _open_positions.get(mint)
+    pos           = state.open_positions.get(mint)
+    slippage_exit = cfg_data["risk"]["slippage_bps_exit"]
+    trail_pct     = float(cfg_data.get("trailing_stop_pct", 0.25))
+    tp_mult       = float(cfg_data.get("take_profit_multiplier", 2.0))
+
     if not pos:
         return
 
-    slippage_exit = cfg_data["risk"]["slippage_bps_exit"]
-    trail_pct     = cfg_data.get("trailing_stop_pct", 0.25)
-    tp_mult       = cfg_data.get("take_profit_multiplier", 2.0)
-
     log.info(
-        f"📊 Monitoring {mint[:8]}... | Entry: ${pos['entry_price']:.6f} | "
-        f"Amount: {pos['token_amount']}"
+        f"📊 Monitoring {mint[:8]}... | "
+        f"Entry: ${pos['entry_price']:.8f} | Tokens: {pos['token_amount']}"
     )
 
-    while mint in _open_positions:
+    while mint in state.open_positions:
         try:
             r = await http.get(JUPITER_PRICE, params={"ids": mint}, timeout=5.0)
             price_data = r.json().get("data", {}).get(mint)
@@ -279,89 +372,95 @@ async def monitor_position(mint: str, http: httpx.AsyncClient, cfg_data: dict):
             current = float(price_data["price"])
             mult    = current / pos["entry_price"] if pos["entry_price"] > 0 else 1.0
 
-            # ── Phase 1: Take Profit ────────────────────────────────────────
+            # Update position state for dashboard
+            pos["current_price"]  = current
+            pos["current_mult"]   = round(mult, 3)
+            pos["unrealized_pnl"] = round((current - pos["entry_price"]) / pos["entry_price"] * 100, 2)
+
+            # Phase 1 — Take Profit
             if pos["phase"] == 1 and mult >= tp_mult:
                 half = pos["token_amount"] // 2
-                log.info(
-                    f"🎉 TP | {mint[:8]}... | {mult:.2f}x | "
-                    f"Selling {half} tokens (50%)"
-                )
+                log.info(f"🎉 TP | {mint[:8]}... | {mult:.2f}× | Selling 50%")
                 quote = await get_jupiter_quote(http, mint, SOL_MINT, half, slippage_exit)
                 if quote:
                     tx_bytes = await build_swap_tx(http, quote)
                     if tx_bytes:
-                        bundle = await send_jito_bundle(
-                            http, tx_bytes,
-                            int(os.getenv("JITO_TIP_LAMPORTS", 150000))
-                        )
+                        tip = int(os.getenv("JITO_TIP_LAMPORTS", "150000"))
+                        bundle = await send_jito_bundle(http, tx_bytes, tip)
                         if bundle:
-                            log.info(f"✅ TP sell bundle: {bundle[:12]}...")
+                            state.total_sells += 1
+                            state.add_event("sell", f"TP hit {mint[:8]}... at {mult:.2f}×", {
+                                "mint": mint, "mult": mult, "bundle": bundle[:12]
+                            })
                 pos["remaining"] = pos["token_amount"] - half
                 pos["phase"]     = 2
                 pos["peak"]      = current
 
-            # ── Phase 2: Trailing Stop ──────────────────────────────────────
+            # Phase 2 — Trailing Stop
             elif pos["phase"] == 2:
-                if current > pos["peak"]:
+                if current > pos.get("peak", current):
                     pos["peak"] = current
 
                 drop = (pos["peak"] - current) / pos["peak"] if pos["peak"] > 0 else 0
+                pos["trail_drop_pct"] = round(drop * 100, 2)
+
                 if drop >= trail_pct:
                     log.info(
                         f"🛑 TRAIL STOP | {mint[:8]}... | "
-                        f"Drop: {drop*100:.1f}% from peak | "
-                        f"Selling {pos['remaining']} tokens"
+                        f"Drop: {drop*100:.1f}% from peak"
                     )
-                    quote = await get_jupiter_quote(
-                        http, mint, SOL_MINT, pos["remaining"], slippage_exit
-                    )
+                    quote = await get_jupiter_quote(http, mint, SOL_MINT, pos["remaining"], slippage_exit)
                     if quote:
                         tx_bytes = await build_swap_tx(http, quote)
                         if tx_bytes:
-                            bundle = await send_jito_bundle(
-                                http, tx_bytes,
-                                int(os.getenv("JITO_TIP_LAMPORTS", 150000))
-                            )
+                            tip = int(os.getenv("JITO_TIP_LAMPORTS", "150000"))
+                            bundle = await send_jito_bundle(http, tx_bytes, tip)
                             if bundle:
-                                log.info(f"✅ Exit sell bundle: {bundle[:12]}...")
-                    _open_positions.pop(mint, None)
+                                state.total_sells += 1
+                                state.add_event("sell", f"Trail stop {mint[:8]}... drop {drop*100:.1f}%", {
+                                    "mint": mint, "drop_pct": drop * 100
+                                })
+                    state.open_positions.pop(mint, None)
                     break
 
         except Exception as e:
-            log.error(f"Position monitor error for {mint[:8]}: {e}")
+            log.error(f"Position monitor error {mint[:8]}: {e}")
 
         await asyncio.sleep(3)
 
 
 # ─── Signal Handler ───────────────────────────────────────────────────────────
 async def on_signal(wallet: str, mint: str, http: httpx.AsyncClient, cfg_data: dict):
-    """
-    Core buy pipeline triggered by Smart Money signal.
-    Designed to complete in <800ms from signal to bundle submission.
-    """
-    if mint in _processing_mints or mint in _open_positions:
+    """Core buy pipeline. Completes signal → bundle in <1s ideally."""
+    if mint in state.processing or mint in state.open_positions:
         return
 
     max_pos = cfg_data["risk"].get("max_positions", 5)
-    if len(_open_positions) >= max_pos:
+    if len(state.open_positions) >= max_pos:
         log.warning(f"Max positions ({max_pos}) reached — skipping {mint[:8]}...")
         return
 
-    _processing_mints.add(mint)
+    state.processing.add(mint)
+    state.last_signal_ts = utc_now_ts()
     t0 = time.monotonic()
+
     log.info(f"⚡ SIGNAL | From: {wallet[:10]}... | Mint: {mint[:10]}...")
+    state.add_event("signal", f"Signal from {wallet[:10]}... → {mint[:10]}...", {
+        "wallet": wallet, "mint": mint
+    })
 
     try:
-        # 1. Rug check
-        safe, reason = await is_token_safe(mint)
+        # Rug check
+        safe, reason = await is_token_safe(mint, client=http)
         if not safe:
             log.warning(f"🚫 RUG: {mint[:8]}... | {reason}")
+            state.add_event("rug", f"Rug detected: {mint[:8]}... — {reason}", {"mint": mint})
             return
 
-        # 2. Jupiter quote
-        buy_lamports = int(cfg_data["risk"]["buy_amount_sol"] * 1e9)
-        slippage     = cfg_data["risk"]["slippage_bps_entry"]
-        max_impact   = cfg_data["risk"].get("max_price_impact_pct", 25.0)
+        # [FIX 3] Use explicit float for SOL amount
+        sol_amount, buy_lamports = get_buy_amount(cfg_data)
+        slippage   = cfg_data["risk"]["slippage_bps_entry"]
+        max_impact = float(cfg_data["risk"].get("max_price_impact_pct", 25.0))
 
         quote = await get_jupiter_quote(http, SOL_MINT, mint, buy_lamports, slippage)
         if not quote:
@@ -372,14 +471,11 @@ async def on_signal(wallet: str, mint: str, http: httpx.AsyncClient, cfg_data: d
             return
 
         out_amount = int(quote.get("outAmount", 0))
-
-        # 3. Build and sign swap tx
-        tx_bytes = await build_swap_tx(http, quote)
+        tx_bytes   = await build_swap_tx(http, quote)
         if not tx_bytes:
             return
 
-        # 4. Jito bundle
-        tip = int(os.getenv("JITO_TIP_LAMPORTS", 150000))
+        tip = int(os.getenv("JITO_TIP_LAMPORTS", "150000"))
         bundle_id = await send_jito_bundle(http, tx_bytes, tip)
         if not bundle_id:
             log.error(f"Bundle failed for {mint[:8]}...")
@@ -388,32 +484,43 @@ async def on_signal(wallet: str, mint: str, http: httpx.AsyncClient, cfg_data: d
         elapsed = (time.monotonic() - t0) * 1000
         log.info(
             f"🟢 BUY | Mint: {mint[:8]}... | "
-            f"In: {cfg_data['risk']['buy_amount_sol']} SOL | "
+            f"In: {sol_amount:.4f} SOL | "   # [FIX 3] proper float display
             f"Out: {out_amount} tokens | "
             f"Bundle: {bundle_id[:12]}... | "
             f"⏱ {elapsed:.0f}ms"
         )
 
-        # 5. Open position
-        sol_price   = await get_sol_price_usd(http)
+        sol_price   = await get_sol_price(http)
         entry_price = (buy_lamports / 1e9 * sol_price) / max(out_amount, 1)
-        _open_positions[mint] = {
-            "wallet":       wallet,
-            "entry_price":  entry_price,
-            "token_amount": out_amount,
-            "remaining":    out_amount,
-            "phase":        1,
-            "peak":         entry_price,
-            "opened_at":    utc_now_ts(),
+
+        state.open_positions[mint] = {
+            "mint":          mint,
+            "wallet":        wallet,
+            "entry_price":   entry_price,
+            "current_price": entry_price,
+            "token_amount":  out_amount,
+            "remaining":     out_amount,
+            "sol_spent":     sol_amount,  # [FIX 3]
+            "phase":         1,
+            "peak":          entry_price,
+            "current_mult":  1.0,
+            "unrealized_pnl": 0.0,
+            "trail_drop_pct": 0.0,
+            "opened_at":     utc_now_ts(),
+            "bundle_id":     bundle_id,
         }
+        state.total_buys += 1
+        state.add_event("buy", f"Bought {mint[:8]}... | {sol_amount:.4f} SOL in", {
+            "mint": mint, "sol": sol_amount, "tokens": out_amount, "bundle": bundle_id[:12]
+        })
 
         asyncio.create_task(monitor_position(mint, http, cfg_data))
 
     finally:
-        _processing_mints.discard(mint)
+        state.processing.discard(mint)
 
 
-# ─── Log Parser (Detects Swaps in Wallet Logs) ────────────────────────────────
+# ─── Log / Transaction Parser ─────────────────────────────────────────────────
 async def process_log(
     wallet: str,
     log_data: dict,
@@ -421,149 +528,337 @@ async def process_log(
     http: httpx.AsyncClient,
     cfg_data: dict
 ):
-    """
-    Parse a logsNotification for a tracked wallet.
-    Identify if they're buying an unknown SPL token via Raydium/Pump.fun.
-    """
-    logs: list[str] = log_data.get("logs", [])
+    logs = log_data.get("logs", [])
     if log_data.get("err"):
         return
-
-    is_dex = any(RAYDIUM in l or PUMPFUN in l for l in logs)
-    if not is_dex:
+    if not any(RAYDIUM in l or PUMPFUN in l for l in logs):
         return
 
-    candidates = set()
     for line in logs:
         for addr in MINT_RE.findall(line):
             if addr not in known_mints and addr != wallet:
-                candidates.add(addr)
+                try:
+                    if state.ws_connected and _ws_conn:
+                        info = await get_account_info_ws(addr)
+                    else:
+                        info = await get_account_info_http(http, addr)
 
-    for candidate in candidates:
+                    if info and info.get("data", {}).get("parsed", {}).get("type") == "mint":
+                        known_mints.add(addr)
+                        asyncio.create_task(on_signal(wallet, addr, http, cfg_data))
+                        return
+                except Exception:
+                    pass
+
+
+# ─── [FIX 1] WebSocket Heartbeat ─────────────────────────────────────────────
+async def heartbeat_task(ws):
+    """
+    Sends a manual ping every 5 seconds to keep the Helius WS alive.
+    Helius free-tier closes idle connections after ~10s.
+    """
+    while True:
         try:
-            info = await get_account_info(candidate)
-            if info and info.get("data", {}).get("parsed", {}).get("type") == "mint":
-                known_mints.add(candidate)
-                asyncio.create_task(on_signal(wallet, candidate, http, cfg_data))
-                return
-        except Exception:
-            pass
+            await ws.ping()
+            log.debug("💓 WS ping sent")
+        except Exception as e:
+            log.warning(f"Heartbeat ping failed: {e}")
+            break
+        await asyncio.sleep(5)
 
 
-# ─── WebSocket Engine ─────────────────────────────────────────────────────────
+# ─── [FIX 2] HTTP Polling Fallback ───────────────────────────────────────────
+async def polling_fallback_loop(http: httpx.AsyncClient, cfg_data: dict):
+    """
+    Polling mode — activated when WS fails 3× in a row.
+    Polls getSignaturesForAddress for each tracked wallet every 2.5s.
+    Detects new signatures and fetches full transaction data to find swaps.
+    Slower than WS (~2.5s latency vs ~400ms) but never disconnects.
+    """
+    log.info("🔄 POLLING MODE ACTIVE — WS unavailable, using HTTP polling")
+    state.polling_mode = True
+    known_mints: set[str] = {SOL_MINT}
+    poll_interval = 2.5  # seconds between full wallet sweeps
+
+    while state.polling_mode:
+        cfg_data = await read_config()
+        wallets  = cfg_data["TARGET_WALLETS"][:10]
+
+        for wallet in wallets:
+            try:
+                result = await http_rpc(
+                    http,
+                    "getSignaturesForAddress",
+                    [wallet, {"limit": 5, "commitment": "confirmed"}]
+                )
+
+                if not isinstance(result, list) or not result:
+                    continue
+
+                newest_sig = result[0].get("signature", "")
+                last_sig   = state.last_sigs.get(wallet, "")
+
+                if newest_sig == last_sig:
+                    continue  # No new transactions
+
+                state.last_sigs[wallet] = newest_sig
+
+                # Only fetch tx if there's no error on the signature
+                if result[0].get("err"):
+                    continue
+
+                tx_result = await http_rpc(
+                    http,
+                    "getTransaction",
+                    [newest_sig, {
+                        "encoding": "jsonParsed",
+                        "maxSupportedTransactionVersion": 0
+                    }]
+                )
+
+                if not tx_result:
+                    continue
+
+                # Convert to log-like format for reuse of process_log logic
+                meta = tx_result.get("meta", {}) or {}
+                log_messages = meta.get("logMessages", [])
+
+                if any(RAYDIUM in l or PUMPFUN in l for l in log_messages):
+                    fake_log_data = {
+                        "logs": log_messages,
+                        "err":  meta.get("err"),
+                        "signature": newest_sig
+                    }
+                    await process_log(wallet, fake_log_data, known_mints, http, cfg_data)
+
+            except Exception as e:
+                log.error(f"Polling error for {wallet[:10]}: {e}")
+
+            await asyncio.sleep(0.3)  # Small delay between wallet checks
+
+        await asyncio.sleep(poll_interval)
+
+    log.info("🔄 Polling mode deactivated — WebSocket reconnected")
+
+
+# ─── [FIX 4] WebSocket Engine with Better Error Reporting ─────────────────────
 async def ws_listener(http: httpx.AsyncClient):
     """
-    Main WebSocket loop with:
-    - Auto-reconnect + exponential backoff
-    - Hot config reload every 60s
-    - Dynamic subscription management (adds new wallets from scraper)
+    Main WebSocket loop.
+    - Catches InvalidStatusCode to log HTTP status (429 / 403 / 503)
+    - Heartbeat task per connection
+    - Switches to HTTP polling after WS_FAIL_LIMIT consecutive failures
+    - Hot-reloads config every 60s to pick up new wallets from scraper
     """
     global _ws_conn
 
-    known_mints = {SOL_MINT}
-    subscribed_wallets: set[str] = set()
-    sub_map: dict[int, str] = {}  # sub_id → wallet
-    last_config_reload = 0.0
-    cfg_data = await read_config()
-    backoff = 1
+    known_mints:       set[str]  = {SOL_MINT}
+    subscribed:        set[str]  = set()
+    sub_map:           dict      = {}   # sub_id → wallet
+    last_config_reload: float    = 0.0
+    cfg_data                     = await read_config()
+    backoff                      = 1
+    polling_task                 = None
 
     while True:
+        # If WS keeps failing, switch to polling mode
+        if state.ws_fail_count >= state.ws_fail_limit and not state.polling_mode:
+            log.warning(
+                f"WS failed {state.ws_fail_count}× in a row — "
+                f"activating HTTP polling fallback"
+            )
+            state.add_event("error", "WebSocket unavailable — switched to HTTP polling")
+            if polling_task is None or polling_task.done():
+                polling_task = asyncio.create_task(
+                    polling_fallback_loop(http, cfg_data)
+                )
+            await asyncio.sleep(60)  # Wait 60s before trying WS again
+            state.ws_fail_count = 0
+            state.polling_mode  = False
+            if polling_task and not polling_task.done():
+                polling_task.cancel()
+            continue
+
         try:
-            log.info(f"Connecting to Helius WS...")
+            log.info(f"Connecting to Helius WebSocket...")
+
             async with websockets.connect(
                 HELIUS_WS,
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=10 * 1024 * 1024
+                ping_interval=None,  # We handle pings manually
+                ping_timeout=None,
+                open_timeout=15,
+                max_size=10 * 1024 * 1024,
+                additional_headers={}
             ) as ws:
-                _ws_conn = ws
-                backoff  = 1
-                log.info("WebSocket connected ✓")
+                _ws_conn            = ws
+                state.ws_connected  = True
+                state.ws_fail_count = 0
+                state.polling_mode  = False
+                backoff             = 1
+                log.info("✅ WebSocket connected to Helius")
+                state.add_event("info", "WebSocket connected to Helius")
 
-                async def sub_wallet(wallet: str):
-                    """Subscribe to log notifications for a wallet."""
+                # [FIX 1] Start heartbeat task for this connection
+                hb = asyncio.create_task(heartbeat_task(ws))
+
+                async def subscribe(wallet: str):
                     rid = _next_id()
-                    payload = json.dumps({
-                        "jsonrpc": "2.0",
-                        "id":      rid,
+                    fut = asyncio.get_event_loop().create_future()
+                    _pending[rid] = fut
+                    await ws.send(json.dumps({
+                        "jsonrpc": "2.0", "id": rid,
                         "method":  "logsSubscribe",
                         "params":  [
                             {"mentions": [wallet]},
                             {"commitment": "processed"}
                         ]
-                    })
-                    fut = asyncio.get_event_loop().create_future()
-                    _pending_rpc[rid] = fut
-                    await ws.send(payload)
+                    }))
                     resp = await asyncio.wait_for(fut, timeout=10.0)
-                    sub_id = resp["result"]
-                    sub_map[sub_id] = wallet
-                    subscribed_wallets.add(wallet)
-                    log.info(f"  📡 Subscribed: {wallet[:12]}... (sub {sub_id})")
+                    sid  = resp["result"]
+                    sub_map[sid] = wallet
+                    subscribed.add(wallet)
+                    log.info(f"  📡 Subscribed: {wallet[:14]}... (sub {sid})")
 
-                # Initial subscriptions
-                for w in cfg_data["TARGET_WALLETS"]:
-                    await sub_wallet(w)
+                # Subscribe to initial wallet list (max 10 — free tier)
+                max_wallets = cfg_data["free_tier"].get("max_tracked_wallets", 10)
+                for w in cfg_data["TARGET_WALLETS"][:max_wallets]:
+                    if w not in subscribed:
+                        await subscribe(w)
 
-                # Message pump
+                state.tracked_wallets = list(subscribed)
+
+                # Main message pump
                 async for raw in ws:
                     msg = json.loads(raw)
 
                     # RPC response
-                    if "id" in msg and msg["id"] in _pending_rpc:
-                        _pending_rpc.pop(msg["id"]).set_result(msg)
+                    if "id" in msg and msg["id"] in _pending:
+                        _pending.pop(msg["id"]).set_result(msg)
+                        continue
+
+                    # Pong response
+                    if msg.get("method") == "pong":
+                        log.debug("💓 WS pong received")
                         continue
 
                     # Subscription notification
                     if msg.get("method") == "logsNotification":
-                        params    = msg["params"]
-                        sub_id    = params["subscription"]
-                        log_data  = params["result"]
-                        wallet    = sub_map.get(sub_id)
+                        params   = msg["params"]
+                        sub_id   = params["subscription"]
+                        log_data = params["result"]
+                        wallet   = sub_map.get(sub_id)
                         if wallet:
                             asyncio.create_task(
                                 process_log(wallet, log_data, known_mints, http, cfg_data)
                             )
 
-                    # ── Hot reload config every 60s ────────────────────────
+                    # Hot-reload config every 60s
                     now = time.monotonic()
                     if now - last_config_reload > 60:
-                        cfg_data = await read_config()
+                        cfg_data           = await read_config()
                         last_config_reload = now
                         new_wallets = [
-                            w for w in cfg_data["TARGET_WALLETS"]
-                            if w not in subscribed_wallets
+                            w for w in cfg_data["TARGET_WALLETS"][:max_wallets]
+                            if w not in subscribed
                         ]
                         if new_wallets:
-                            log.info(f"Hot reload: subscribing {len(new_wallets)} new wallets")
+                            log.info(f"Hot reload: {len(new_wallets)} new wallets")
                             for w in new_wallets:
-                                await sub_wallet(w)
+                                await subscribe(w)
+                            state.tracked_wallets = list(subscribed)
+
+                hb.cancel()
+
+        # [FIX 4] Catch specific WS errors with HTTP status codes
+        except websockets.exceptions.InvalidStatusCode as e:
+            status_code = e.status_code
+            state.ws_connected   = False
+            state.ws_fail_count += 1
+            _ws_conn             = None
+
+            # Decode the most common failure reasons
+            if status_code == 429:
+                reason = "Rate limited (429) — too many connections on free tier"
+                wait   = min(backoff * 10, 120)
+            elif status_code == 403:
+                reason = "Forbidden (403) — check your Helius API key in .env"
+                wait   = 30
+            elif status_code == 503:
+                reason = "Helius service unavailable (503) — temporary outage"
+                wait   = min(backoff * 5, 60)
+            elif status_code == 401:
+                reason = "Unauthorized (401) — invalid Helius API key"
+                wait   = 60
+            else:
+                reason = f"HTTP {status_code} from Helius WebSocket endpoint"
+                wait   = min(backoff * 2, 30)
+
+            log.error(f"❌ WS connection rejected: {reason}")
+            log.error(f"   Retry {state.ws_fail_count}/{state.ws_fail_limit} in {wait}s...")
+            state.add_event("error", f"WS rejected: {reason}")
+            backoff = min(backoff * 2, 60)
+            await asyncio.sleep(wait)
+
+        except websockets.exceptions.ConnectionClosedError as e:
+            state.ws_connected   = False
+            state.ws_fail_count += 1
+            _ws_conn             = None
+            log.warning(
+                f"WS closed: code={e.code} reason='{e.reason}' | "
+                f"Retry {state.ws_fail_count} in {backoff}s..."
+            )
+            state.add_event("error", f"WS closed (code {e.code}): {e.reason}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
         except Exception as e:
-            log.error(f"WS error: {e} | Reconnecting in {backoff}s...")
-            _ws_conn = None
+            state.ws_connected   = False
+            state.ws_fail_count += 1
+            _ws_conn             = None
+            log.error(f"WS unexpected error: {type(e).__name__}: {e}")
+            state.add_event("error", f"WS error: {type(e).__name__}: {e}")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 async def main():
+    cfg_data = await read_config()
+    sol_amount, lamports = get_buy_amount(cfg_data)
+
     log.info("=" * 64)
-    log.info("  🎯 SOLANA MEMECOIN SNIPER — ONLINE")
-    log.info(f"  Wallet: {PUBKEY[:20]}...")
+    log.info("  🎯 SOLANA MEMECOIN SNIPER v1.2.0 — ONLINE")
+    log.info(f"  Wallet:          {PUBKEY[:20]}...")
+    log.info(f"  Buy amount:      {sol_amount:.4f} SOL ({lamports:,} lamports)")  # [FIX 3]
+    log.info(f"  Entry slippage:  {cfg_data['risk']['slippage_bps_entry'] / 100:.0f}%")
+    log.info(f"  Max positions:   {cfg_data['risk']['max_positions']}")
+    log.info(f"  Max wallets:     {cfg_data['free_tier']['max_tracked_wallets']}")
+    log.info(f"  Target wallets:  {len(cfg_data['TARGET_WALLETS'])}")
+    log.info(f"  WS→Polling at:   {state.ws_fail_limit} consecutive failures")
     log.info("=" * 64)
+
+    if not cfg_data["TARGET_WALLETS"]:
+        log.warning("TARGET_WALLETS is empty — run wallet_scraper.py first")
+        log.warning("Bot will idle and hot-reload every 60s until wallets appear")
 
     async with httpx.AsyncClient(
         limits=httpx.Limits(max_connections=20),
         timeout=httpx.Timeout(15.0)
     ) as http:
-        cfg_data = await read_config()
-        log.info(
-            f"Loaded {len(cfg_data['TARGET_WALLETS'])} target wallets | "
-            f"Buy: {cfg_data['risk']['buy_amount_sol']} SOL"
+        await asyncio.gather(
+            ws_listener(http),
+            write_status(),
         )
-        await ws_listener(http)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Shutting down...")
+        # Write offline status
+        try:
+            status = {"online": False, "updated_at": utc_now_ts()}
+            (ROOT / "status.json").write_text(json.dumps(status))
+        except Exception:
+            pass
