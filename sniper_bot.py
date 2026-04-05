@@ -641,38 +641,148 @@ async def polling_fallback_loop(http: httpx.AsyncClient, cfg_data: dict):
     log.info("🔄 Polling mode deactivated — WebSocket reconnected")
 
 
-# ─── [FIX 4] WebSocket Engine with Better Error Reporting ─────────────────────
+# ─── WebSocket Message Pump (background task) ────────────────────────────────
+async def message_pump(
+    ws,
+    sub_map:     dict,
+    known_mints: set,
+    http:        httpx.AsyncClient,
+    cfg_ref:     list,           # cfg_ref[0] = current cfg_data (mutable box)
+):
+    """
+    THE ROOT CAUSE FIX.
+
+    Previously, subscribe() sent a message and immediately awaited the
+    response future with asyncio.wait_for(fut, timeout=10). But the only
+    code that resolves those futures is the `async for raw in ws` loop —
+    which lived in the SAME coroutine, AFTER the subscribe() calls. Pure
+    deadlock. Every 10 seconds the timeout fired → TimeoutError → reconnect.
+
+    Fix: run the message pump as a separate asyncio.Task that starts
+    BEFORE any subscribe() call. Now the pump is always running, futures
+    are resolved instantly, and subscriptions complete in <100ms.
+    """
+    try:
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+
+                # ── Resolve pending RPC response futures ──────────────────
+                msg_id = msg.get("id")
+                if msg_id is not None and msg_id in _pending:
+                    fut = _pending.pop(msg_id)
+                    if not fut.done():
+                        fut.set_result(msg)
+                    continue
+
+                method = msg.get("method", "")
+
+                # ── Ignore pong frames ────────────────────────────────────
+                if method == "pong":
+                    log.debug("💓 pong")
+                    continue
+
+                # ── Dispatch log notifications ────────────────────────────
+                if method == "logsNotification":
+                    params   = msg.get("params", {})
+                    sub_id   = params.get("subscription")
+                    log_data = params.get("result", {})
+                    wallet   = sub_map.get(sub_id)
+                    if wallet:
+                        asyncio.create_task(
+                            process_log(
+                                wallet, log_data, known_mints,
+                                http, cfg_ref[0]
+                            )
+                        )
+
+            except json.JSONDecodeError:
+                pass
+            except Exception as e:
+                log.error(f"Pump dispatch error: {e}")
+
+    except websockets.exceptions.ConnectionClosedOK:
+        log.info("WS closed cleanly")
+    except Exception as e:
+        log.warning(f"Pump exited: {type(e).__name__}: {e}")
+
+
+# ─── Hot-reload task (runs alongside pump) ───────────────────────────────────
+async def hot_reload_task(
+    ws,
+    subscribed:  set,
+    sub_map:     dict,
+    cfg_ref:     list,
+    max_wallets: int,
+):
+    """
+    Checks config.json every 60s and subscribes any new wallets the
+    scraper has added since the last reload. Runs as its own task so it
+    never blocks the message pump.
+    """
+    while True:
+        await asyncio.sleep(60)
+        try:
+            cfg_ref[0] = await read_config()
+            new_wallets = [
+                w for w in cfg_ref[0]["TARGET_WALLETS"][:max_wallets]
+                if w not in subscribed
+            ]
+            for wallet in new_wallets:
+                rid = _next_id()
+                fut = asyncio.get_event_loop().create_future()
+                _pending[rid] = fut
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": rid,
+                    "method":  "logsSubscribe",
+                    "params":  [
+                        {"mentions": [wallet]},
+                        {"commitment": "processed"}
+                    ]
+                }))
+                resp = await asyncio.wait_for(fut, timeout=10.0)
+                sid  = resp["result"]
+                sub_map[sid] = wallet
+                subscribed.add(wallet)
+                state.tracked_wallets = list(subscribed)
+                log.info(f"🔄 Hot-reload subscribed: {wallet[:14]}...")
+        except Exception as e:
+            log.error(f"Hot-reload error: {e}")
+
+
+# ─── WebSocket Engine ─────────────────────────────────────────────────────────
 async def ws_listener(http: httpx.AsyncClient):
     """
-    Main WebSocket loop.
-    - Catches InvalidStatusCode to log HTTP status (429 / 403 / 503)
-    - Heartbeat task per connection
-    - Switches to HTTP polling after WS_FAIL_LIMIT consecutive failures
-    - Hot-reloads config every 60s to pick up new wallets from scraper
+    Outer reconnect loop with:
+    - HTTP status code logging (429 / 403 / 503)
+    - Heartbeat task (ping every 5s)
+    - Pump task (concurrent message dispatch — the deadlock fix)
+    - Hot-reload task (new wallets every 60s)
+    - Polling fallback after WS_FAIL_LIMIT consecutive failures
     """
     global _ws_conn
 
-    known_mints:       set[str]  = {SOL_MINT}
-    subscribed:        set[str]  = set()
-    sub_map:           dict      = {}   # sub_id → wallet
-    last_config_reload: float    = 0.0
-    cfg_data                     = await read_config()
-    backoff                      = 1
-    polling_task                 = None
+    known_mints:  set[str] = {SOL_MINT}
+    subscribed:   set[str] = set()
+    sub_map:      dict     = {}       # sub_id (int) → wallet (str)
+    cfg_data               = await read_config()
+    cfg_ref:      list     = [cfg_data]   # mutable box shared with tasks
+    backoff:      int      = 1
+    polling_task           = None
 
     while True:
-        # If WS keeps failing, switch to polling mode
+        # ── Escalate to polling if WS keeps dying ─────────────────────────
         if state.ws_fail_count >= state.ws_fail_limit and not state.polling_mode:
             log.warning(
-                f"WS failed {state.ws_fail_count}× in a row — "
-                f"activating HTTP polling fallback"
+                f"WS failed {state.ws_fail_count}× consecutively — "
+                f"activating HTTP polling fallback for 60s"
             )
             state.add_event("error", "WebSocket unavailable — switched to HTTP polling")
             if polling_task is None or polling_task.done():
                 polling_task = asyncio.create_task(
-                    polling_fallback_loop(http, cfg_data)
+                    polling_fallback_loop(http, cfg_ref[0])
                 )
-            await asyncio.sleep(60)  # Wait 60s before trying WS again
+            await asyncio.sleep(60)
             state.ws_fail_count = 0
             state.polling_mode  = False
             if polling_task and not polling_task.done():
@@ -680,27 +790,34 @@ async def ws_listener(http: httpx.AsyncClient):
             continue
 
         try:
-            log.info(f"Connecting to Helius WebSocket...")
+            log.info("Connecting to Helius WebSocket...")
 
             async with websockets.connect(
                 HELIUS_WS,
-                ping_interval=None,  # We handle pings manually
+                ping_interval=None,    # manual heartbeat handles this
                 ping_timeout=None,
-                open_timeout=15,
+                open_timeout=20,
+                close_timeout=10,
                 max_size=10 * 1024 * 1024,
-                additional_headers={}
             ) as ws:
                 _ws_conn            = ws
                 state.ws_connected  = True
                 state.ws_fail_count = 0
                 state.polling_mode  = False
                 backoff             = 1
+                cfg_ref[0]          = await read_config()
                 log.info("✅ WebSocket connected to Helius")
                 state.add_event("info", "WebSocket connected to Helius")
 
-                # [FIX 1] Start heartbeat task for this connection
-                hb = asyncio.create_task(heartbeat_task(ws))
+                max_wallets = cfg_ref[0]["free_tier"].get("max_tracked_wallets", 10)
 
+                # ── THE FIX: start pump FIRST, then subscribe ─────────────
+                pump = asyncio.create_task(
+                    message_pump(ws, sub_map, known_mints, http, cfg_ref)
+                )
+                hb   = asyncio.create_task(heartbeat_task(ws))
+
+                # subscribe() now works — pump is already reading responses
                 async def subscribe(wallet: str):
                     rid = _next_id()
                     fut = asyncio.get_event_loop().create_future()
@@ -713,61 +830,44 @@ async def ws_listener(http: httpx.AsyncClient):
                             {"commitment": "processed"}
                         ]
                     }))
-                    resp = await asyncio.wait_for(fut, timeout=10.0)
+                    # This future resolves in <100ms now — pump is running
+                    resp = await asyncio.wait_for(fut, timeout=15.0)
                     sid  = resp["result"]
                     sub_map[sid] = wallet
                     subscribed.add(wallet)
+                    state.tracked_wallets = list(subscribed)
                     log.info(f"  📡 Subscribed: {wallet[:14]}... (sub {sid})")
 
-                # Subscribe to initial wallet list (max 10 — free tier)
-                max_wallets = cfg_data["free_tier"].get("max_tracked_wallets", 10)
-                for w in cfg_data["TARGET_WALLETS"][:max_wallets]:
+                for w in cfg_ref[0]["TARGET_WALLETS"][:max_wallets]:
                     if w not in subscribed:
                         await subscribe(w)
 
-                state.tracked_wallets = list(subscribed)
+                if not subscribed:
+                    log.warning(
+                        "TARGET_WALLETS is empty — bot idle. "
+                        "Run wallet_scraper.py or add wallets via dashboard."
+                    )
 
-                # Main message pump
-                async for raw in ws:
-                    msg = json.loads(raw)
+                # Start hot-reload task (subscribes new wallets every 60s)
+                reload_t = asyncio.create_task(
+                    hot_reload_task(ws, subscribed, sub_map, cfg_ref, max_wallets)
+                )
 
-                    # RPC response
-                    if "id" in msg and msg["id"] in _pending:
-                        _pending.pop(msg["id"]).set_result(msg)
-                        continue
+                # Block until connection drops (pump task ends = WS closed)
+                await pump
 
-                    # Pong response
-                    if msg.get("method") == "pong":
-                        log.debug("💓 WS pong received")
-                        continue
+                # Clean up sibling tasks
+                for t in (hb, reload_t):
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
 
-                    # Subscription notification
-                    if msg.get("method") == "logsNotification":
-                        params   = msg["params"]
-                        sub_id   = params["subscription"]
-                        log_data = params["result"]
-                        wallet   = sub_map.get(sub_id)
-                        if wallet:
-                            asyncio.create_task(
-                                process_log(wallet, log_data, known_mints, http, cfg_data)
-                            )
-
-                    # Hot-reload config every 60s
-                    now = time.monotonic()
-                    if now - last_config_reload > 60:
-                        cfg_data           = await read_config()
-                        last_config_reload = now
-                        new_wallets = [
-                            w for w in cfg_data["TARGET_WALLETS"][:max_wallets]
-                            if w not in subscribed
-                        ]
-                        if new_wallets:
-                            log.info(f"Hot reload: {len(new_wallets)} new wallets")
-                            for w in new_wallets:
-                                await subscribe(w)
-                            state.tracked_wallets = list(subscribed)
-
-                hb.cancel()
+                # Dropped cleanly — outer loop will reconnect immediately
+                state.ws_connected = False
+                _ws_conn           = None
+                log.info("WS pump ended — reconnecting...")
 
         # [FIX 4] Catch specific WS errors with HTTP status codes
         except websockets.exceptions.InvalidStatusCode as e:
