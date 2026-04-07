@@ -37,6 +37,7 @@ JUPITER_PRICE = "https://price.jup.ag/v4/price"
 HELIUS_HTTP   = os.getenv("HELIUS_RPC_HTTP", "")
 HELIUS_WS     = os.getenv("HELIUS_RPC_WS", "")
 JITO_URL      = os.getenv("JITO_BLOCK_ENGINE_URL", "")
+LATEST_BLOCKHASH = ""
 
 SOL_MINT      = "So11111111111111111111111111111111111111112"
 WSOL_MINT     = "So11111111111111111111111111111111111111112"
@@ -211,38 +212,30 @@ def get_buy_amount(cfg_data: dict) -> tuple[float, int]:
 
 
 # ─── Rug-Pull Check ───────────────────────────────────────────────────────────
-async def is_token_safe(
-    mint: str,
-    client: Optional[httpx.AsyncClient] = None
-) -> tuple[bool, str]:
+async def is_token_safe(mint: str, client: httpx.AsyncClient) -> tuple[bool, str]:
+    """Validates token safety via RugCheck API."""
     try:
-        if state.ws_connected and _ws_conn:
-            info = await get_account_info_ws(mint)
-        elif client:
-            info = await get_account_info_http(client, mint)
-        else:
-            return True, "No RPC connection (Assumed safe for speed)"
-
-        if not info:
-            return True, "Mint account not found (Ignored for speed)"
-
-        parsed   = info.get("data", {}).get("parsed", {})
-        mint_inf = parsed.get("info", {})
-
-        if parsed and parsed.get("type") != "mint":
-            return False, "Not an SPL mint"
-
-        if mint_inf.get("mintAuthority") is not None:
-            return False, f"Mint authority live: {str(mint_inf['mintAuthority'])[:10]}..."
-        if mint_inf.get("freezeAuthority") is not None:
-            return False, f"Freeze authority live: {str(mint_inf['freezeAuthority'])[:10]}..."
-
-        return True, "OK"
-
-    except asyncio.TimeoutError:
-        return True, "RPC timeout during rug check (Ignored for speed)"
+        # Free API endpoint for token risk assessment
+        r = await client.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary", timeout=5.0)
+        if r.status_code != 200:
+            return True, "RugCheck unreachable (skipping for speed)"
+            
+        data = r.json()
+        risks = data.get("risks", [])
+        
+        # Abort if the token has high-danger flags
+        for risk in risks:
+            name = risk.get("name", "")
+            level = risk.get("level", "")
+            
+            if level == "danger" and name in ["Freeze Authority still enabled", "Single holder ownership", "Low Liquidity"]:
+                return False, f"RugCheck Danger: {name}"
+                
+        return True, "RugCheck OK"
+        
     except Exception as e:
-        return True, f"Rug check error ignored: {e}"
+        log.debug(f"RugCheck error ignored: {e}")
+        return True, "API Error"
 
 
 # ─── Jupiter Client (WITH DNS FIX / RETRIES) ──────────────────────────────────
@@ -308,7 +301,7 @@ async def send_jito_bundle(
 ) -> Optional[str]:
     for attempt in range(3):
         try:
-            blockhash = await get_latest_blockhash(http)
+            blockhash = LATEST_BLOCKHASH if LATEST_BLOCKHASH else await get_latest_blockhash(http)
             tip_ix    = transfer(TransferParams(
                 from_pubkey=KEYPAIR.pubkey(),
                 to_pubkey=Pubkey.from_string(random.choice(JITO_TIP_ACCOUNTS)),
@@ -500,11 +493,24 @@ async def on_signal(wallet: str, mint: str, http: httpx.AsyncClient, cfg_data: d
             "current_mult":  1.0,
         }
         state.total_buys += 1
-        asyncio.create_task(monitor_position(mint, http, cfg_data))
+        asyncio.create_task(get_fast_token_price(mint, http))
 
     finally:
         state.processing.discard(mint)
 
+# Remove the old JUPITER_PRICE call in monitor_position and replace with this:
+async def get_fast_token_price(mint: str, http: httpx.AsyncClient) -> Optional[float]:
+    """Fetches real-time price bypassing Jupiter indexing delays."""
+    try:
+        r = await http.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5.0)
+        pairs = r.json().get("pairs", [])
+        if pairs:
+            # Get the pool with the highest liquidity
+            best_pair = max(pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0)))
+            return float(best_pair.get("priceUsd", 0))
+    except Exception:
+        pass
+    return None
 
 # ─── Transaction Analyzer ─────────────────────────────────────────────────────
 # ─── Transaction Analyzer ─────────────────────────────────────────────────────
@@ -569,87 +575,81 @@ async def fast_detect_from_token_accounts(
 async def analyze_transaction(
     wallet: str, signature: str, http: httpx.AsyncClient, cfg_data: dict, known_mints: set[str]
 ) -> None:
-    if state.is_wallet_ignored(wallet):
+    if state.is_wallet_ignored(wallet) or state.is_rate_limited():
         return
 
-    RETRIES = 8
-    RETRY_DELAY = 0.5
-    tx = None
+    try:
+        tx = await http_rpc(http, "getTransaction", [
+            signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}
+        ])
+    except Exception:
+        return
 
-    for attempt in range(1, RETRIES + 1):
-        if state.is_rate_limited():
-            log.info(f"⏳ Global Rate Limit Active — pausing TX scan for {signature[:8]}")
-            await asyncio.sleep(RETRY_DELAY)
+    if not tx or tx.get("meta", {}).get("err"): 
+        return
+
+    meta = tx["meta"]
+    
+    # Map pre and post token balances for THIS wallet only
+    def get_wallet_tokens(balances: list) -> dict:
+        token_map = {}
+        for b in balances:
+            if b.get("owner") == wallet:
+                mint = b.get("mint", "")
+                amt = float(b.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+                token_map[mint] = amt
+        return token_map
+
+    pre_tokens = get_wallet_tokens(meta.get("preTokenBalances", []))
+    post_tokens = get_wallet_tokens(meta.get("postTokenBalances", []))
+
+    # Identify all mints the wallet interacted with
+    all_mints = set(pre_tokens.keys()).union(set(post_tokens.keys()))
+
+    for mint in all_mints:
+        if mint in IGNORED_MINTS:
             continue
+            
+        pre_amt = pre_tokens.get(mint, 0.0)
+        post_amt = post_tokens.get(mint, 0.0)
+        delta = post_amt - pre_amt
 
-        try:
-            tx = await http_rpc(http, "getTransaction", [
-                signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}
-            ])
-        except Exception:
-            tx = None
-
-        if tx:
-            log.info(f"📥 TX indexed: {signature[:12]}...")
-            break
-
-        if attempt < RETRIES:
-            await asyncio.sleep(RETRY_DELAY)
-
-    if not tx:
-        return
-
-    meta = tx.get("meta") or {}
-    if meta.get("err"): return
-
-    account_keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
-    wallet_idx = next((i for i, ak in enumerate(account_keys) if (ak.get("pubkey") if isinstance(ak, dict) else str(ak)) == wallet), None)
-    if wallet_idx is None: return
-
-    pre_bal  = meta.get("preBalances",  [])
-    post_bal = meta.get("postBalances", [])
-    if wallet_idx >= len(pre_bal) or wallet_idx >= len(post_bal): return
-
-    # 1. Calcular SOL nativo gasto
-    sol_spent = -(post_bal[wallet_idx] - pre_bal[wallet_idx]) / 1e9
-
-    # 2. Construir mapas de tokens ANTES da verificação de threshold
-    def token_map(balances: list) -> dict:
-        out = {}
-        for e in balances:
-            mint  = e.get("mint", "")
-            owner = e.get("owner", "")
-            amt   = float((e.get("uiTokenAmount") or {}).get("uiAmount") or 0)
-            out[(mint, owner)] = amt
-        return out
-
-    pre_map  = token_map(meta.get("preTokenBalances",  []))
-    post_map = token_map(meta.get("postTokenBalances", []))
-
-    # 3. Calcular WSOL gasto
-    wsol_pre = pre_map.get((WSOL_MINT, wallet), 0.0)
-    wsol_post = post_map.get((WSOL_MINT, wallet), 0.0)
-    wsol_spent = wsol_pre - wsol_post
-
-    # 4. Calcular o Gasto Total (Nativo + Wrapped)
-    total_sol_spent = sol_spent + wsol_spent
-
-    # 5. Verificação do Threshold usando o valor total
-    if total_sol_spent < MIN_SOL_SPENT:
-        log.info(f"🗑️ Skipping {signature[:8]}: Dust/Fee/WSOL ({total_sol_spent:+.6f} SOL total). Cooldown wallet {wallet[:8]} for 3s.")
-        state.ignore_wallet(wallet, 3.0)
-        return
-
-    # 6. Procurar a moeda comprada
-    for (mint, owner), post_amt in post_map.items():
-        if owner != wallet: continue
-        if mint in IGNORED_MINTS or mint in known_mints: continue
-        delta = post_amt - pre_map.get((mint, owner), 0.0)
-        if delta > 0:
-            log.info(f"💡 SLOW DETECT | Wallet: {wallet[:10]}... | Mint: {mint[:10]}...")
+        if delta > 0 and mint not in known_mints:
+            # COPY-BUY SIGNAL
+            log.info(f"🟢 COPY-BUY SIGNAL | Wallet: {wallet[:8]}... | Mint: {mint[:8]}...")
             known_mints.add(mint)
             asyncio.create_task(on_signal(wallet, mint, http, cfg_data))
+            
+        elif delta < 0 and mint in state.open_positions:
+            # COPY-SELL SIGNAL (Insider is dumping)
+            log.warning(f"🔴 COPY-SELL SIGNAL | Insider {wallet[:8]}... is dumping {mint[:8]}!")
+            asyncio.create_task(emergency_sell(mint, http, cfg_data))
 
+async def emergency_sell(mint: str, http: httpx.AsyncClient, cfg_data: dict):
+    """Instantly sells an open position when the tracked wallet sells."""
+    pos = state.open_positions.get(mint)
+    if not pos or pos.get("selling"):
+        return
+        
+    pos["selling"] = True # Prevent duplicate sell calls
+    slippage_exit = cfg_data["risk"]["slippage_bps_exit"]
+    
+    log.info(f"🚨 EXECUTING EMERGENCY SELL | {mint[:8]}...")
+    
+    quote = await get_jupiter_quote(http, mint, SOL_MINT, pos["remaining"], slippage_exit)
+    if quote:
+        tx_bytes = await build_swap_tx(http, quote)
+        if tx_bytes:
+            tip = int(os.getenv("JITO_TIP_LAMPORTS", "200000")) # Higher tip for emergency exits
+            bundle = await send_jito_bundle(http, tx_bytes, tip)
+            if bundle:
+                state.total_sells += 1
+                state.add_event("sell", f"Copy-Sold {mint[:8]}...", {})
+                state.open_positions.pop(mint, None)
+                log.info(f"✅ EMERGENCY SELL SUCCESS | {mint[:8]}...")
+                return
+                
+    log.error(f"❌ EMERGENCY SELL FAILED | Require manual intervention for {mint[:8]}...")
 
 # ─── WebSocket Engine / Fallbacks / Main ──────────────────────────────────────
 async def heartbeat_task(ws):
@@ -805,12 +805,21 @@ async def ws_listener(http: httpx.AsyncClient):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
+async def keep_blockhash_fresh(http: httpx.AsyncClient):
+    global LATEST_BLOCKHASH
+    while True:
+        try:
+            LATEST_BLOCKHASH = await get_latest_blockhash(http)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
 async def main():
     cfg_data = await read_config()
     log.info("  🎯 SOLANA MEMECOIN SNIPER v1.2.1 — ONLINE")
     
     async with httpx.AsyncClient(limits=httpx.Limits(max_connections=20), timeout=httpx.Timeout(15.0)) as http:
-        await asyncio.gather(ws_listener(http), write_status())
+        await asyncio.gather(ws_listener(http), write_status(), keep_blockhash_fresh(http))
 
 if __name__ == "__main__":
     try:

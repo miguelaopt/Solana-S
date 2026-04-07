@@ -11,10 +11,10 @@
     "trailing_stop_pct": 0.25
   },
   "filters": {
-    "min_win_rate": 0.60,
+    "min_win_rate": 0.70,
     "prune_win_rate": 0.40,
     "min_trades_for_qualification": 5,
-    "max_tx_per_day": 500,
+    "max_tx_per_day": 30,
     "min_unique_tokens_traded": 3,
     "prune_lookback_days": 7,
     "discovery_pool_min_volume_usd": 500000,
